@@ -60,17 +60,42 @@ def get_chrome_driver(headless: bool = True) -> webdriver.Chrome:
 	options.add_argument("--disable-dev-shm-usage")
 	options.add_argument("--disable-gpu")
 	options.add_argument("--window-size=1366,900")
+	# Reduce automation fingerprints
+	options.add_experimental_option("excludeSwitches", ["enable-automation"])
+	options.add_experimental_option("useAutomationExtension", False)
+	options.add_argument("--disable-blink-features=AutomationControlled")
+	options.add_argument("--lang=en-IN")
+	options.add_argument(
+		"--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	)
 
 	# Prefer webdriver-manager to avoid PATH chromedriver conflicts entirely
 	if ChromeDriverManager is not None:
 		driver_path = ChromeDriverManager().install()
 		service = ChromeService(executable_path=driver_path)
-		return webdriver.Chrome(service=service, options=options)
+		driver = webdriver.Chrome(service=service, options=options)
+		# Patch navigator.webdriver and other properties early
+		try:
+			driver.execute_cdp_cmd(
+				"Page.addScriptToEvaluateOnNewDocument",
+				{"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"},
+			)
+		except Exception:
+			pass
+		return driver
 
 	# Fallback: try Selenium Manager with PATH cleaned
 	_hide_chromedriver_from_path()
 	try:
-		return webdriver.Chrome(options=options)
+		driver = webdriver.Chrome(options=options)
+		try:
+			driver.execute_cdp_cmd(
+				"Page.addScriptToEvaluateOnNewDocument",
+				{"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"},
+			)
+		except Exception:
+			pass
+		return driver
 	except SessionNotCreatedException:
 		# Re-raise if we couldn't use webdriver-manager above
 		raise
@@ -108,7 +133,12 @@ def click_naukri_login(headless: bool = True, timeout: int = 20, email: str = ""
 				raise
 
 		wait = WebDriverWait(driver, timeout)
-		driver.get("https://www.naukri.com/")
+		start_url = (
+			"https://login.naukri.com/nLogin/Login.php"
+			if os.getenv("GITHUB_ACTIONS", "").lower() == "true"
+			else "https://www.naukri.com/"
+		)
+		driver.get(start_url)
 
 
 		# small settle
@@ -148,42 +178,44 @@ def click_naukri_login(headless: bool = True, timeout: int = 20, email: str = ""
 		Path("screenshots").mkdir(exist_ok=True)
 		driver.save_screenshot("screenshots/01_home.png")
 
-		# Wait for the login link to be present (not necessarily clickable due to overlays)
-		login_locators = [
-			(By.ID, "login_Layer"),
-			(By.CSS_SELECTOR, "a#login_Layer"),
-			(By.CSS_SELECTOR, "a[title='Jobseeker Login']"),
-			(By.XPATH, "//a[@id='login_Layer' or @title='Jobseeker Login' or contains(@class,'nI-gNb-lg-rg__login')]")
-		]
-		el = None
-		last_exc = None
-		for loc in login_locators:
+		# If we're not already on the login page, click the Login link
+		if "login" not in driver.current_url.lower():
+			# Wait for the login link to be present (not necessarily clickable due to overlays)
+			login_locators = [
+				(By.ID, "login_Layer"),
+				(By.CSS_SELECTOR, "a#login_Layer"),
+				(By.CSS_SELECTOR, "a[title='Jobseeker Login']"),
+				(By.XPATH, "//a[@id='login_Layer' or @title='Jobseeker Login' or contains(@class,'nI-gNb-lg-rg__login')]")
+			]
+			el = None
+			last_exc = None
+			for loc in login_locators:
+				try:
+					el = WebDriverWait(driver, max(6, timeout // 2)).until(EC.presence_of_element_located(loc))
+					if el:
+						break
+				except TimeoutException as te:
+					last_exc = te
+					continue
+			if not el:
+				raise last_exc or TimeoutException("Login element not found")
+
+			# Scroll and JS-click to avoid intermittent intercepts
+			driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
 			try:
-				el = WebDriverWait(driver, max(6, timeout // 2)).until(EC.presence_of_element_located(loc))
-				if el:
-					break
-			except TimeoutException as te:
-				last_exc = te
-				continue
-		if not el:
-			raise last_exc or TimeoutException("Login element not found")
+				el.click()
+			except Exception:
+				driver.execute_script("arguments[0].click();", el)
 
-		# Scroll and JS-click to avoid intermittent intercepts
-		driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
-		try:
-			el.click()
-		except Exception:
-			driver.execute_script("arguments[0].click();", el)
+			# Optional: wait briefly for resulting layer/navigation
+			time.sleep(1.5)
 
-		# Optional: wait briefly for resulting layer/navigation
-		time.sleep(1.5)
+			# Heuristic: either navigates to a login page or opens a login layer
+			current_url = driver.current_url
+			print(f"After click, URL: {current_url}")
 
-		# Heuristic: either navigates to a login page or opens a login layer
-		current_url = driver.current_url
-		print(f"After click, URL: {current_url}")
-
-		# Save a proof screenshot
-		driver.save_screenshot("screenshots/02_after_click.png")
+			# Save a proof screenshot
+			driver.save_screenshot("screenshots/02_after_click.png")
 
 		# If credentials provided, try to fill them now
 		if email and password:
