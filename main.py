@@ -110,7 +110,15 @@ def get_safari_driver() -> webdriver.Safari:
 	return webdriver.Safari()
 
 
-def click_naukri_login(headless: bool = True, timeout: int = 20, email: str = "", password: str = "") -> None:
+def click_naukri_login(
+	headless: bool = True,
+	timeout: int = 20,
+	email: str = "",
+	password: str = "",
+	use_google: bool = False,
+	google_email: str = "",
+	google_password: str = "",
+) -> None:
 	"""Open naukri.com and click the Login button.
 
 	This tries Chrome first; if unavailable, falls back to Safari on macOS.
@@ -217,8 +225,20 @@ def click_naukri_login(headless: bool = True, timeout: int = 20, email: str = ""
 			# Save a proof screenshot
 			driver.save_screenshot("screenshots/02_after_click.png")
 
-		# If credentials provided, try to fill them now
-		if email and password:
+		# If Google sign-in is requested, try that first
+		if use_google and google_email and google_password:
+			try:
+				google_sign_in(driver, google_email, google_password, timeout=timeout)
+				print("Signed in with Google.")
+				try:
+					navigate_profile_and_save(driver, timeout=timeout)
+					print("Navigated to View profile, clicked edit, and pressed Save.")
+				except TimeoutException:
+					print("Profile/edit/save elements not found within timeout.")
+			except TimeoutException:
+				print("Google Sign-In flow did not complete within timeout.")
+		# Else fall back to email/password on-site login
+		elif email and password:
 			try:
 				fill_credentials(driver, email=email, password=password, timeout=timeout)
 				print("Filled email and password fields.")
@@ -254,6 +274,100 @@ def click_naukri_login(headless: bool = True, timeout: int = 20, email: str = ""
 			driver.quit()
 		if tried:
 			print(f"Tried drivers: {', '.join(tried)}")
+
+
+def google_sign_in(driver, g_email: str, g_password: str, timeout: int = 30) -> None:
+	wait = WebDriverWait(driver, timeout)
+	# Ensure the login layer is visible; if not on login page, open it using existing flow above.
+	# Click the "Sign in with Google" button
+	google_btn_locators = [
+		(By.XPATH, "//div[contains(@class,'google')][.//span[contains(normalize-space(.), 'Sign in with Google')]]"),
+		(By.CSS_SELECTOR, "div.social-media .google"),
+		(By.CSS_SELECTOR, "div.google")
+	]
+	btn = None
+	for loc in google_btn_locators:
+		try:
+			btn = wait.until(EC.presence_of_element_located(loc))
+			if btn:
+				break
+		except TimeoutException:
+			continue
+	if not btn:
+		raise TimeoutException("Google Sign-In button not found")
+
+	before = driver.window_handles
+	driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+	try:
+		btn.click()
+	except Exception:
+		driver.execute_script("arguments[0].click();", btn)
+
+	time.sleep(1.0)
+	# Switch to Google Accounts window/tab if a new one opened
+	after = driver.window_handles
+	target_handle = None
+	if len(after) > len(before):
+		for h in after:
+			if h not in before:
+				driver.switch_to.window(h)
+				target_handle = h
+				break
+	# If no new window, stay in current and continue
+
+	# Now perform Google auth
+	# Sometimes there's an account chooser; click "Use another account" if present
+	try:
+		use_another = WebDriverWait(driver, 5).until(
+			EC.presence_of_element_located((By.XPATH, "//div[@role='button' and .//div[text()='Use another account']]"))
+		)
+		try:
+			use_another.click()
+		except Exception:
+			driver.execute_script("arguments[0].click();", use_another)
+	except TimeoutException:
+		pass
+
+	# Email step
+	email_input = wait.until(EC.presence_of_element_located((By.ID, "identifierId")))
+	email_input.clear()
+	email_input.send_keys(g_email)
+	next_btn = wait.until(EC.element_to_be_clickable((By.ID, "identifierNext")))
+	try:
+		next_btn.click()
+	except Exception:
+		driver.execute_script("arguments[0].click();", next_btn)
+
+	# Password step
+	pwd_input = wait.until(EC.presence_of_element_located((By.NAME, "Passwd")))
+	try:
+		pwd_input.clear()
+	except Exception:
+		pass
+	pwd_input.send_keys(g_password)
+	pwd_next = wait.until(EC.element_to_be_clickable((By.ID, "passwordNext")))
+	try:
+		pwd_next.click()
+	except Exception:
+		driver.execute_script("arguments[0].click();", pwd_next)
+
+	# Wait for redirect back to Naukri
+	WebDriverWait(driver, max(10, timeout)).until(
+		EC.any_of(
+			EC.url_contains("naukri.com"),
+			EC.url_matches(r"https?://.*naukri\.com/.*"),
+		)
+	)
+	# If a new window was used and we're still on Google, try switching back to any Naukri window
+	for h in driver.window_handles:
+		try:
+			driver.switch_to.window(h)
+			if "naukri.com" in (driver.current_url or "").lower():
+				break
+		except Exception:
+			continue
+	Path("screenshots").mkdir(exist_ok=True)
+	driver.save_screenshot("screenshots/03_google_after_login.png")
 
 
 def _switch_to_frame_with_inputs(driver, email_locators, password_locators, timeout=5):
@@ -485,34 +599,36 @@ def navigate_profile_and_save(driver, timeout: int = 20) -> None:
 
 
 def parse_args(argv=None):
-	p = argparse.ArgumentParser(description="Automate naukri.com login button click with Selenium")
+	p = argparse.ArgumentParser(description="Automate naukri.com login via Google Sign-In and profile update with Selenium")
 	p.add_argument("--headless", action="store_true", help="Run browser in headless mode (Chrome only)")
 	p.add_argument("--timeout", type=int, default=20, help="Explicit wait timeout in seconds")
-	p.add_argument("--email", default=None, help="Email/username (falls back to env NAUKRI_EMAIL if omitted)")
-	p.add_argument("--password", dest="password", default=None, help="Password (falls back to env NAUKRI_PASSWORD if omitted)")
 	return p.parse_args(argv)
 
 
 def main(argv=None) -> int:
 	args = parse_args(argv)
-	def _resolve_credentials(arg_email, arg_password):
-		email = arg_email or os.getenv("NAUKRI_EMAIL", "")
-		password = arg_password or os.getenv("NAUKRI_PASSWORD", "")
-		if not email or not password:
-			print("Warning: missing credentials. Provide --email/--password or set NAUKRI_EMAIL/NAUKRI_PASSWORD.")
-		return email, password
 
-	# In GitHub Actions, always run headless and fail fast if secrets are missing
+	# Always use Google SSO and reuse NAUKRI_EMAIL/NAUKRI_PASSWORD as Google credentials
+	use_google = True
+	g_email = os.getenv("NAUKRI_EMAIL", "")
+	g_pass = os.getenv("NAUKRI_PASSWORD", "")
+	if not g_email or not g_pass:
+		print("Error: NAUKRI_EMAIL/NAUKRI_PASSWORD must be set (used as Google credentials).")
+		return 2
+
+	# In GitHub Actions, always run headless
 	if os.getenv("GITHUB_ACTIONS", "").lower() == "true":
 		args.headless = True
-		ci_email = os.getenv("NAUKRI_EMAIL", "")
-		ci_password = os.getenv("NAUKRI_PASSWORD", "")
-		if not ci_email or not ci_password:
-			print("Error: NAUKRI_EMAIL/NAUKRI_PASSWORD not set in GitHub Actions secrets.")
-			return 2
 
-	res_email, res_password = _resolve_credentials(args.email, args.password)
-	click_naukri_login(headless=args.headless, timeout=args.timeout, email=res_email, password=res_password)
+	click_naukri_login(
+		headless=args.headless,
+		timeout=args.timeout,
+		email="",
+		password="",
+		use_google=use_google,
+		google_email=g_email,
+		google_password=g_pass,
+	)
 	return 0
 
 
