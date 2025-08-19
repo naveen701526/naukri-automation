@@ -1,26 +1,18 @@
 name: Run Naukri Automation
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
   schedule:
-    # IST is UTC+5:30; the times below are 06:00, 09:00, 11:00, 14:00 IST
-    - cron: '30 0 * * *'  # 06:00 IST
-    - cron: '30 3 * * *'  # 09:00 IST
-    - cron: '30 5 * * *'  # 11:00 IST
-    - cron: '30 8 * * *'  # 14:00 IST
+    - cron: '30 0,3,5,8 * * *'  # 06:00, 09:00, 11:00, 14:00 IST
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      actions: read
-      checks: write
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -28,7 +20,7 @@ jobs:
       - name: Install Google Chrome
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget gnupg2 ca-certificates
+          sudo apt-get install -y wget gnupg
           wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/google-linux-signing-keyring.gpg
           echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux-signing-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
           sudo apt-get update
@@ -39,19 +31,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Selenium script (headless)
+      - name: Run script
         env:
+          GITHUB_ACTIONS: 'true'
           NAUKRI_EMAIL: ${{ secrets.NAUKRI_EMAIL }}
           NAUKRI_PASSWORD: ${{ secrets.NAUKRI_PASSWORD }}
         run: |
-          python main.py --headless --timeout 60 \
-            --email "$NAUKRI_EMAIL" \
-            --password "$NAUKRI_PASSWORD"
+          python main.py --headless --timeout 60
 
-      - name: Upload screenshots artifact
+      - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: screenshots
-          path: screenshots/**
-          if-no-files-found: ignore
+          path: screenshots
