@@ -16,6 +16,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.common.keys import Keys
 
 try:
 	# Optional dependency, used as fallback when local PATH chromedriver is incompatible
@@ -281,14 +282,20 @@ def google_sign_in(driver, g_email: str, g_password: str, timeout: int = 30) -> 
 	# Ensure the login layer is visible; if not on login page, open it using existing flow above.
 	# Click the "Sign in with Google" button
 	google_btn_locators = [
-		(By.XPATH, "//div[contains(@class,'google')][.//span[contains(normalize-space(.), 'Sign in with Google')]]"),
+		# Most reliable: find the visible control that contains the span text
+		(By.XPATH, "//span[normalize-space()='Sign in with Google']/ancestor::*[self::button or self::a or self::div][1]"),
+		# Generic: any clickable element with the text
+		(By.XPATH, "//*[self::button or self::a or self::div][contains(normalize-space(.), 'Sign in with Google')]"),
+		# Attribute hints
+		(By.XPATH, "//button[contains(@aria-label,'Sign in with Google') or contains(@class,'google') or contains(@data-qa,'google')]"),
+		(By.CSS_SELECTOR, "button[aria-label*='Sign in with Google' i]"),
 		(By.CSS_SELECTOR, "div.social-media .google"),
-		(By.CSS_SELECTOR, "div.google")
+		(By.CSS_SELECTOR, "div.google"),
 	]
 	btn = None
 	for loc in google_btn_locators:
 		try:
-			btn = wait.until(EC.presence_of_element_located(loc))
+			btn = wait.until(EC.element_to_be_clickable(loc))
 			if btn:
 				break
 		except TimeoutException:
@@ -329,27 +336,100 @@ def google_sign_in(driver, g_email: str, g_password: str, timeout: int = 30) -> 
 		pass
 
 	# Email step
-	email_input = wait.until(EC.presence_of_element_located((By.ID, "identifierId")))
-	email_input.clear()
-	email_input.send_keys(g_email)
-	next_btn = wait.until(EC.element_to_be_clickable((By.ID, "identifierNext")))
+	email_locators = [
+		(By.ID, "identifierId"),
+		(By.NAME, "identifier"),
+		(By.CSS_SELECTOR, "input[type='email'][id='identifierId']"),
+		(By.CSS_SELECTOR, "input[type='email'][name='identifier']"),
+	]
+	email_input = None
+	last_exc = None
+	for loc in email_locators:
+		try:
+			email_input = wait.until(EC.visibility_of_element_located(loc))
+			if email_input:
+				break
+		except TimeoutException as te:
+			last_exc = te
+			continue
+	if not email_input:
+		raise last_exc or TimeoutException("Google email input not found")
+
 	try:
-		next_btn.click()
+		email_input.clear()
 	except Exception:
-		driver.execute_script("arguments[0].click();", next_btn)
+		pass
+	email_input.send_keys(g_email)
+	Path("screenshots").mkdir(exist_ok=True)
+	driver.save_screenshot("screenshots/03a_google_email_filled.png")
+
+	email_next_locators = [
+		(By.ID, "identifierNext"),
+		(By.XPATH, "//span[normalize-space()='Next']/ancestor::*[self::button or self::div][@role='button'][1]"),
+		(By.XPATH, "//*[@id='identifierNext' or @jsname='LgbsSe'][.//span[normalize-space()='Next']]")
+	]
+	clicked_next = False
+	for loc in email_next_locators:
+		try:
+			next_btn = WebDriverWait(driver, 8).until(EC.element_to_be_clickable(loc))
+			try:
+				next_btn.click()
+			except Exception:
+				driver.execute_script("arguments[0].click();", next_btn)
+			clicked_next = True
+			break
+		except TimeoutException:
+			continue
+	if not clicked_next:
+		# Fallback: press Enter
+		email_input.send_keys(Keys.ENTER)
+
+	time.sleep(0.8)
+	driver.save_screenshot("screenshots/03b_google_after_email_next.png")
 
 	# Password step
-	pwd_input = wait.until(EC.presence_of_element_located((By.NAME, "Passwd")))
+	pwd_locators = [
+		(By.NAME, "Passwd"),
+		(By.CSS_SELECTOR, "input[type='password'][name='Passwd']"),
+	]
+	pwd_input = None
+	last_exc = None
+	for loc in pwd_locators:
+		try:
+			pwd_input = wait.until(EC.visibility_of_element_located(loc))
+			if pwd_input:
+				break
+		except TimeoutException as te:
+			last_exc = te
+			continue
+	if not pwd_input:
+		raise last_exc or TimeoutException("Google password input not found")
+
 	try:
 		pwd_input.clear()
 	except Exception:
 		pass
 	pwd_input.send_keys(g_password)
-	pwd_next = wait.until(EC.element_to_be_clickable((By.ID, "passwordNext")))
-	try:
-		pwd_next.click()
-	except Exception:
-		driver.execute_script("arguments[0].click();", pwd_next)
+	driver.save_screenshot("screenshots/03c_google_password_filled.png")
+
+	pwd_next_locators = [
+		(By.ID, "passwordNext"),
+		(By.XPATH, "//span[normalize-space()='Next']/ancestor::*[self::button or self::div][@role='button'][1]"),
+	]
+	clicked_pwd_next = False
+	for loc in pwd_next_locators:
+		try:
+			pwd_next = WebDriverWait(driver, 8).until(EC.element_to_be_clickable(loc))
+			try:
+				pwd_next.click()
+			except Exception:
+				driver.execute_script("arguments[0].click();", pwd_next)
+			clicked_pwd_next = True
+			break
+		except TimeoutException:
+			continue
+	if not clicked_pwd_next:
+		pwd_input.send_keys(Keys.ENTER)
 
 	# Wait for redirect back to Naukri
 	WebDriverWait(driver, max(10, timeout)).until(
