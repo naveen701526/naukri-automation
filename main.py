@@ -3,6 +3,9 @@ import os
 import shutil
 import sys
 import time
+import re
+import imaplib
+import email as py_email
 from pathlib import Path
 
 from selenium import webdriver
@@ -226,37 +229,32 @@ def click_naukri_login(
 			# Save a proof screenshot
 			driver.save_screenshot("screenshots/02_after_click.png")
 
-		# If Google sign-in is requested, try that first
-		if use_google and google_email and google_password:
+		# OTP login flow (default): click "Use OTP to Login", send OTP to email, fetch via IMAP, fill and verify
+		try:
+			start_otp_login(driver, email=email, timeout=timeout)
+			print("Requested OTP to email.")
+			Path("screenshots").mkdir(exist_ok=True)
+			driver.save_screenshot("screenshots/03_otp_challenge.png")
+
+			# Fetch OTP via IMAP
+			imap_host = os.getenv("IMAP_HOST", "imap.gmail.com")
+			imap_user = os.getenv("NAUKRI_EMAIL", email)
+			imap_pass = os.getenv("NAUKRI_PASSWORD", password)
+			otp_sender = os.getenv("OTP_SENDER", "naukri")
+			otp_subject = os.getenv("OTP_SUBJECT", "otp|verification|login")
+			otp = fetch_otp_via_imap(imap_host, imap_user, imap_pass, timeout=max(60, timeout), sender_hint=otp_sender, subject_hint=otp_subject)
+			print(f"Fetched OTP: {'*' * len(otp)}")
+
+			fill_otp(driver, otp, timeout=timeout)
+			print("Entered OTP and submitted.")
+
 			try:
-				google_sign_in(driver, google_email, google_password, timeout=timeout)
-				print("Signed in with Google.")
-				try:
-					navigate_profile_and_save(driver, timeout=timeout)
-					print("Navigated to View profile, clicked edit, and pressed Save.")
-				except TimeoutException:
-					print("Profile/edit/save elements not found within timeout.")
+				navigate_profile_and_save(driver, timeout=timeout)
+				print("Navigated to View profile, clicked edit, and pressed Save.")
 			except TimeoutException:
-				print("Google Sign-In flow did not complete within timeout.")
-		# Else fall back to email/password on-site login
-		elif email and password:
-			try:
-				fill_credentials(driver, email=email, password=password, timeout=timeout)
-				print("Filled email and password fields.")
-				# Click the Login submit button
-				try:
-					click_login_submit(driver, timeout=timeout)
-					print("Clicked the Login submit button.")
-					# Proceed to profile flow
-					try:
-						navigate_profile_and_save(driver, timeout=timeout)
-						print("Navigated to View profile, clicked edit, and pressed Save.")
-					except TimeoutException:
-						print("Profile/edit/save elements not found within timeout.")
-				except TimeoutException:
-					print("Login submit button not found within timeout.")
-			except TimeoutException:
-				print("Could not locate login input fields to fill within timeout.")
+				print("Profile/edit/save elements not found within timeout.")
+		except TimeoutException as te:
+			print(f"OTP login flow failed within timeout: {te}")
 
 		# Soft assertion: URL contains 'login' or a visible username/email field appears
 		try:
@@ -275,6 +273,192 @@ def click_naukri_login(
 			driver.quit()
 		if tried:
 			print(f"Tried drivers: {', '.join(tried)}")
+
+
+def start_otp_login(driver, email: str, timeout: int = 20) -> None:
+	wait = WebDriverWait(driver, timeout)
+	# Click "Use OTP to Login" if present
+	otp_link_locators = [
+		(By.XPATH, "//a[contains(normalize-space(.), 'Use OTP') and contains(normalize-space(.), 'Login')]") ,
+		(By.XPATH, "//button[contains(normalize-space(.), 'Use OTP') and contains(normalize-space(.), 'Login')]") ,
+		(By.CSS_SELECTOR, "a[href*='otp' i], button[href*='otp' i]") ,
+	]
+	for loc in otp_link_locators:
+		try:
+			el = WebDriverWait(driver, max(4, timeout//2)).until(EC.element_to_be_clickable(loc))
+			try:
+				el.click()
+			except Exception:
+				driver.execute_script("arguments[0].click();", el)
+			break
+		except TimeoutException:
+			continue
+
+	# Enter email/username
+	email_locators = [
+		(By.ID, "usernameField"),
+		(By.CSS_SELECTOR, "input[type='email']"),
+		(By.CSS_SELECTOR, "input[name*='email' i]"),
+		(By.CSS_SELECTOR, "input[placeholder*='Email' i]"),
+	]
+	email_el = None
+	for loc in email_locators:
+		try:
+			email_el = wait.until(EC.visibility_of_element_located(loc))
+			if email_el:
+				break
+		except TimeoutException:
+			continue
+	if not email_el:
+		raise TimeoutException("Email field not found for OTP login")
+	try:
+		email_el.clear()
+	except Exception:
+		pass
+	email_el.send_keys(email)
+
+	# Send OTP button
+	send_locators = [
+		(By.XPATH, "//button[contains(., 'Send OTP') or contains(., 'Send One Time Password') or contains(., 'Login')]") ,
+		(By.CSS_SELECTOR, "button[type='submit']"),
+		(By.XPATH, "//input[@type='submit']"),
+	]
+	clicked = False
+	for loc in send_locators:
+		try:
+			btn = wait.until(EC.element_to_be_clickable(loc))
+			try:
+				btn.click()
+			except Exception:
+				driver.execute_script("arguments[0].click();", btn)
+			clicked = True
+			break
+		except TimeoutException:
+			continue
+	if not clicked:
+		# fallback: press Enter in email field
+		email_el.send_keys(Keys.ENTER)
+
+	# Wait for OTP input UI to appear
+	WebDriverWait(driver, max(10, timeout)).until(
+		EC.any_of(
+			EC.presence_of_all_elements_located((By.CSS_SELECTOR, "input[type='tel'][maxlength='1'], input[aria-label*='OTP' i]")),
+			EC.presence_of_element_located((By.XPATH, "//input[contains(@name,'otp' i) or contains(@id,'otp' i)]")),
+		)
+	)
+	time.sleep(0.5)
+
+
+def fetch_otp_via_imap(host: str, user: str, password: str, timeout: int = 90, poll_interval: int = 5, sender_hint: str | None = None, subject_hint: str | None = None) -> str:
+	"""Poll IMAP for the latest OTP email and extract a numeric code.
+
+	Returns the first 6-8 digit code found, preferring 6.
+	"""
+	end_time = time.time() + max(15, timeout)
+	last_error = None
+	while time.time() < end_time:
+		try:
+			with imaplib.IMAP4_SSL(host) as M:
+				M.login(user, password)
+				M.select('INBOX')
+				# Look for UNSEEN first; fallback to recent ALL
+				typ, data = M.search(None, 'UNSEEN')
+				ids = data[0].split() if typ == 'OK' else []
+				if not ids:
+					typ, data = M.search(None, 'ALL')
+					ids = data[0].split()[-10:] if typ == 'OK' else []  # recent 10
+				for msg_id in reversed(ids):  # newest first
+					typ, msg_data = M.fetch(msg_id, '(RFC822)')
+					if typ != 'OK' or not msg_data:
+						continue
+					msg = py_email.message_from_bytes(msg_data[0][1])
+					from_addr = msg.get('From', '')
+					subject = msg.get('Subject', '')
+					if sender_hint and sender_hint.lower() not in from_addr.lower():
+						# if hint provided, filter by it
+						if not (subject_hint and any(h in subject.lower() for h in subject_hint.split('|'))):
+							continue
+					# extract text
+					body_text = ""
+					if msg.is_multipart():
+						for part in msg.walk():
+							ctype = part.get_content_type()
+							if ctype in ('text/plain', 'text/html'):
+								try:
+									body_text += part.get_payload(decode=True).decode(part.get_content_charset() or 'utf-8', errors='ignore') + "\n"
+								except Exception:
+									continue
+					else:
+						try:
+							body_text = msg.get_payload(decode=True).decode(msg.get_content_charset() or 'utf-8', errors='ignore')
+						except Exception:
+							body_text = msg.get_payload() or ''
+					# Find OTP numbers
+					codes = re.findall(r"\b(\d{4,8})\b", body_text)
+					# Prefer 6-digit
+					codes_sorted = sorted(codes, key=lambda c: (abs(len(c) - 6), -len(c)))
+					if codes_sorted:
+						return codes_sorted[0]
+		except Exception as e:
+			last_error = e
+		time.sleep(poll_interval)
+	raise TimeoutException(f"Could not retrieve OTP via IMAP within {timeout}s. Last error: {last_error}")
+
+
+def fill_otp(driver, code: str, timeout: int = 20) -> None:
+	wait = WebDriverWait(driver, timeout)
+	digits = list(code.strip())
+	# Try multi-input OTP fields first
+	inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='tel'][maxlength='1'], input[aria-label*='OTP' i]")
+	if inputs and len(inputs) >= len(digits):
+		for i, d in enumerate(digits):
+			try:
+				inputs[i].clear()
+			except Exception:
+				pass
+			inputs[i].send_keys(d)
+		Path("screenshots").mkdir(exist_ok=True)
+		driver.save_screenshot("screenshots/04_otp_filled.png")
+	else:
+		# Single field fallback
+		single_locators = [
+			(By.XPATH, "//input[contains(@name,'otp' i) or contains(@id,'otp' i)]"),
+			(By.CSS_SELECTOR, "input[name*='otp' i], input[id*='otp' i]")
+		]
+		field = None
+		for loc in single_locators:
+			try:
+				field = wait.until(EC.visibility_of_element_located(loc))
+				if field:
+					break
+			except TimeoutException:
+				continue
+		if not field:
+			raise TimeoutException("OTP input field not found")
+		try:
+			field.clear()
+		except Exception:
+			pass
+		field.send_keys(code)
+		driver.save_screenshot("screenshots/04_otp_filled.png")
+
+	# Click Verify/Submit
+	verify_locators = [
+		(By.XPATH, "//button[contains(., 'Verify') or contains(., 'Submit') or contains(., 'Login')]") ,
+		(By.CSS_SELECTOR, "button[type='submit']"),
+		(By.XPATH, "//input[@type='submit']"),
+	]
+	for loc in verify_locators:
+		try:
+			btn = WebDriverWait(driver, max(4, timeout//2)).until(EC.element_to_be_clickable(loc))
+			try:
+				btn.click()
+			except Exception:
+				driver.execute_script("arguments[0].click();", btn)
+			break
+		except TimeoutException:
+			continue
+	time.sleep(1.0)
 
 
 def google_sign_in(driver, g_email: str, g_password: str, timeout: int = 30) -> None:
@@ -679,7 +863,7 @@ def navigate_profile_and_save(driver, timeout: int = 20) -> None:
 
 
 def parse_args(argv=None):
-	p = argparse.ArgumentParser(description="Automate naukri.com login via Google Sign-In and profile update with Selenium")
+	p = argparse.ArgumentParser(description="Automate naukri.com login via OTP (IMAP) and profile update with Selenium")
 	p.add_argument("--headless", action="store_true", help="Run browser in headless mode (Chrome only)")
 	p.add_argument("--timeout", type=int, default=20, help="Explicit wait timeout in seconds")
 	return p.parse_args(argv)
@@ -688,12 +872,11 @@ def parse_args(argv=None):
 def main(argv=None) -> int:
 	args = parse_args(argv)
 
-	# Always use Google SSO and reuse NAUKRI_EMAIL/NAUKRI_PASSWORD as Google credentials
-	use_google = True
-	g_email = os.getenv("NAUKRI_EMAIL", "")
-	g_pass = os.getenv("NAUKRI_PASSWORD", "")
-	if not g_email or not g_pass:
-		print("Error: NAUKRI_EMAIL/NAUKRI_PASSWORD must be set (used as Google credentials).")
+	# OTP + IMAP flow: reuse NAUKRI_EMAIL as login email and IMAP username; NAUKRI_PASSWORD as IMAP app password
+	login_email = os.getenv("NAUKRI_EMAIL", "")
+	imap_pass = os.getenv("NAUKRI_PASSWORD", "")
+	if not login_email or not imap_pass:
+		print("Error: NAUKRI_EMAIL/NAUKRI_PASSWORD must be set (email + IMAP app password).")
 		return 2
 
 	# In GitHub Actions, always run headless
@@ -703,11 +886,11 @@ def main(argv=None) -> int:
 	click_naukri_login(
 		headless=args.headless,
 		timeout=args.timeout,
-		email="",
-		password="",
-		use_google=use_google,
-		google_email=g_email,
-		google_password=g_pass,
+		email=login_email,
+		password=imap_pass,
+		use_google=False,
+		google_email="",
+		google_password="",
 	)
 	return 0
 
